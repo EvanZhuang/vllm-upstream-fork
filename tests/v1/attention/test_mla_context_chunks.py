@@ -15,6 +15,7 @@ import torch
 
 import vllm.utils.gpu_sync_debug as gsd
 from vllm.model_executor.layers.attention.mla_attention import (
+    accumulate_mla_context_chunk,
     build_mla_chunked_context_metadata,
     init_mla_context_partial,
     reorg_kvcache,
@@ -233,28 +234,39 @@ def test_prefills_without_context_are_skipped_and_neutralized():
         assert torch.isneginf(output_lse[:, token_slice]).all()
 
 
-def test_context_partial_shares_a_padded_chunk_partials_head_stride():
-    """A backend may return its chunk partial as a view of a head-padded
-    buffer. The running partial must share that head stride: the merges with
-    a continuation chunk and with the new tokens' partial require it."""
-    metadata = build_chunked_context([2048, 320], [4, 4], 1024)
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="requires a GPU")
+def test_continuation_merges_a_chunk_partial_of_another_layout():
+    """A backend may return a chunk partial whose layout differs from the
+    running partial's, such as the head-major output of ROCm's flash_attn.
+    The continuation merge must still fold it in, as if it were contiguous."""
+    metadata = build_chunked_context([2048, 32, 32], [3, 5, 7], 1024)
     assert metadata is not None
-    padded = torch.empty(4, 2, 8)[..., :3]
+    first, second = metadata.chunks[:2]
+    assert second.is_continuation
+    device = torch.accelerator.current_accelerator()
+    num_heads, head_size = 2, 8
 
-    output, _ = init_mla_context_partial(
-        metadata, attn_output=padded, attn_softmax_lse=torch.empty(2, 4), num_tokens=8
-    )
-    assert output.shape == (8, 2, 3)
-    assert output.stride(1) == padded.stride(1)
+    def run(head_major: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        torch.manual_seed(0)
+        partials = []
+        for chunk in (first, second):
+            num_tokens = chunk.token_slice.stop - chunk.token_slice.start
+            attn_output = torch.randn(num_tokens, num_heads, head_size, device=device)
+            if head_major:
+                attn_output = attn_output.transpose(0, 1).contiguous().transpose(0, 1)
+            lse = torch.randn(num_heads, num_tokens, device=device)
+            partials.append((chunk, attn_output, lse))
+        output, output_lse = init_mla_context_partial(
+            metadata, *partials[0][1:], num_tokens=15
+        )
+        for chunk, attn_output, lse in partials:
+            accumulate_mla_context_chunk(chunk, attn_output, lse, output, output_lse)
+        return output, output_lse
 
-    # An unpadded partial keeps a contiguous one.
-    output, _ = init_mla_context_partial(
-        metadata,
-        attn_output=torch.empty(4, 2, 3),
-        attn_softmax_lse=torch.empty(2, 4),
-        num_tokens=8,
-    )
-    assert output.is_contiguous()
+    expected_output, expected_lse = run(head_major=False)
+    output, output_lse = run(head_major=True)
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(output_lse, expected_lse)
 
 
 def test_no_context_needs_no_chunks():

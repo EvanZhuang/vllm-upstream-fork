@@ -2832,16 +2832,11 @@ def init_mla_context_partial(
     ``out`` tensor already know that layout and can allocate directly, pairing it
     with ``neutralize_empty_context_partials``.
     """
-    # A backend may return a view of a padded buffer; the merges need the
-    # chunk partials' head stride, so pad the running partial the same way.
-    num_heads, head_size = attn_output.shape[1:]
-    token_stride, head_stride, dim_stride = attn_output.stride()
-    padded = dim_stride == 1 and token_stride == num_heads * head_stride
     output = torch.empty(
-        (num_tokens, num_heads, head_stride if padded else head_size),
+        (num_tokens, *attn_output.shape[1:]),
         dtype=attn_output.dtype,
         device=attn_output.device,
-    )[..., :head_size]
+    )
     output_lse = torch.empty(
         (attn_softmax_lse.shape[0], num_tokens),
         dtype=attn_softmax_lse.dtype,
@@ -2885,12 +2880,25 @@ def accumulate_mla_context_chunk(
         )
         init_start = chunk.continuation_token_end
         num_merged = init_start - token_start
+        prefix_output = output[token_start:init_start]
+        suffix_output = attn_output[:num_merged]
+        if suffix_output.stride() != prefix_output.stride():
+            # merge_attn_states derives every operand's token and head strides
+            # from the prefix's head stride, and a backend may lay its chunk
+            # partial out differently (e.g. head-major on ROCm), so copy it
+            # into the running partial's layout.
+            suffix_output = torch.empty_strided(
+                suffix_output.shape,
+                prefix_output.stride(),
+                dtype=suffix_output.dtype,
+                device=suffix_output.device,
+            ).copy_(suffix_output)
         merge_attn_states(
-            output=output[token_start:init_start],
+            output=prefix_output,
             output_lse=output_lse[:, token_start:init_start],
-            prefix_output=output[token_start:init_start],
+            prefix_output=prefix_output,
             prefix_lse=output_lse[:, token_start:init_start],
-            suffix_output=attn_output[:num_merged],
+            suffix_output=suffix_output,
             suffix_lse=attn_softmax_lse[:, :num_merged],
         )
     if init_start < token_end:
